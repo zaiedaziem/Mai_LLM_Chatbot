@@ -2,6 +2,7 @@
 
 create table if not exists sessions (
   id uuid primary key default gen_random_uuid(),
+  title text,
   created_at timestamptz not null default now()
 );
 

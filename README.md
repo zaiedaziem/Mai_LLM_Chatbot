@@ -27,19 +27,27 @@ Get a free key at [console.groq.com](https://console.groq.com/keys).
 
 ```bash
 cd backend
-python -m venv venv
-venv/Scripts/activate          # macOS/Linux: source venv/bin/activate
-pip install -r requirements-dev.txt
-cp .env.example .env           # then fill in the three keys
-uvicorn main:app --reload
+python -m venv venv                      # create an isolated Python environment in ./venv
+venv/Scripts/activate                    # macOS/Linux: source venv/bin/activate
+                                          # ^ switches this shell to use venv's Python, so installs
+                                          #   below land here instead of your system Python
+pip install -r requirements-dev.txt      # install FastAPI, Supabase, Groq, pytest, etc. into venv
+cp .env.example .env                     # then fill in the three keys (Supabase URL/key, Groq key)
+uvicorn main:app --reload                # start the API server
+                                          # ^ main:app = "the `app` object in main.py"
+                                          #   --reload  = restart automatically on file changes
 ```
+
+Runs on http://localhost:8000. Every command after `activate` must be run
+with the venv still active — if you open a new terminal, run `activate`
+again first.
 
 ### 4. Frontend
 
 ```bash
 cd frontend
-npm install
-npm run dev
+npm install     # download React, Vite and other dependencies into node_modules
+npm run dev     # start the Vite dev server with hot-reload
 ```
 
 Open http://localhost:5173.
@@ -125,18 +133,26 @@ local testing and corrupts tokens under real network conditions.
 cd backend && python -m pytest tests/ -q
 ```
 
-17 tests, ~0.3s, no network. `tests/fakes.py` provides an in-memory Supabase
-(mimicking the chained `.select().eq().order().execute()` builder) and a Groq
-double that replays a scripted token list and records the messages it received.
+26 tests, <0.5s, no network. `tests/fakes.py` provides an in-memory Supabase
+(mimicking the chained `.select().eq().order().execute()` builder, including
+`ON DELETE CASCADE`) and a Groq double that replays a scripted token list and
+records the messages it received.
 
-The suite is organised around the four things that can independently break.
+The suite is organised around the things that can independently break.
 
 **1. Session lifecycle** — a session can be created and its id persisted;
-history starts empty; clearing drops messages but keeps the session row; and
-clearing one session leaves another intact. Unknown session ids are rejected
-with a 404 rather than silently creating orphan messages.
+history starts empty; deleting a session removes its messages too; deleting one
+session leaves another intact; and a deleted session can no longer be chatted
+with. Unknown session ids are rejected with a 404 rather than silently creating
+orphan messages.
 
-**2. Streaming contract** — the response really is `text/event-stream`, and
+**2. Session titles** — a new session has no title; the first message sets one;
+an over-long first message is truncated; and a *second* message does not
+overwrite it (the regression that would otherwise rename a conversation on every
+turn). Renaming is asserted to persist, to 404 on an unknown id, and to reject
+an empty title.
+
+**3. Streaming contract** — the response really is `text/event-stream`, and
 tokens arrive as *separate* frames ending in `{"done": true}`. That per-frame
 assertion is the one that would catch the most likely regression: buffering the
 whole reply and flushing it once still produces correct text, still passes a
@@ -145,13 +161,13 @@ the feature. Empty deltas (which Groq emits at stream edges) are asserted to be
 filtered out, and a provider failure is asserted to arrive as an in-band error
 frame on a 200 response.
 
-**3. Persistence** — both sides of a turn are stored in the right order, and the
+**4. Persistence** — both sides of a turn are stored in the right order, and the
 stored assistant message is asserted to equal the concatenation of the streamed
 frames. That equality is what guarantees a page reload shows the user exactly
 what they watched appear. A failed turn is asserted to leave only the user's
 message behind.
 
-**4. Conversational memory** — the requirement "the LLM should know what the
+**5. Conversational memory** — the requirement "the LLM should know what the
 user asked previously" is only really pinned down by inspecting what was sent to
 the model, so the Groq fake records it. The first turn must send just the new
 message; the second must replay turn one's question *and* answer alongside it.
@@ -172,8 +188,32 @@ looking at it.
 | Method | Path | Purpose |
 | --- | --- | --- |
 | `POST` | `/sessions` | Start a session, returns `session_id` |
+| `GET` | `/sessions` | List all sessions, newest first |
+| `PATCH` | `/sessions/{session_id}` | Rename a session |
+| `DELETE` | `/sessions/{session_id}` | Delete a session and its messages |
 | `GET` | `/messages/{session_id}` | Replay stored history |
 | `POST` | `/chat/stream` | Stream a reply as SSE |
-| `DELETE` | `/sessions/{session_id}` | Clear the transcript |
 
 Interactive docs at http://localhost:8000/docs.
+
+---
+
+## Multi-session history
+
+The brief only required a single session, but the app keeps a sidebar of past
+conversations, because a chat you cannot return to is hard to demo and hard to
+trust.
+
+A session is titled automatically from its first user message (truncated to 50
+characters), which avoids an extra LLM call purely for naming and means the
+title is available the instant the first message is sent. Titles are editable —
+the auto-title is a starting point, not a decision.
+
+`DELETE /sessions/{id}` removes the session row; `messages.session_id` is
+declared `ON DELETE CASCADE`, so the transcript goes with it in one statement
+rather than two round trips that could half-fail.
+
+If your `sessions` table predates the `title` column, apply
+[`migrations/001_add_session_title.sql`](backend/migrations/001_add_session_title.sql)
+— `schema.sql` is `CREATE TABLE IF NOT EXISTS`, so it will not alter a table
+that already exists.

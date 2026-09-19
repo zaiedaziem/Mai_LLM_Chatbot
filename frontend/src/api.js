@@ -6,14 +6,30 @@ export async function createSession() {
   return res.json();
 }
 
+export async function listSessions() {
+  const res = await fetch(`${BASE_URL}/sessions`);
+  if (!res.ok) throw new Error("Could not load sessions");
+  return res.json();
+}
+
+export async function renameSession(sessionId, title) {
+  const res = await fetch(`${BASE_URL}/sessions/${sessionId}`, {
+    method: "PATCH",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ title }),
+  });
+  if (!res.ok) throw new Error("Could not rename session");
+  return res.json();
+}
+
+export async function deleteSession(sessionId) {
+  await fetch(`${BASE_URL}/sessions/${sessionId}`, { method: "DELETE" });
+}
+
 export async function getMessages(sessionId) {
   const res = await fetch(`${BASE_URL}/messages/${sessionId}`);
   if (!res.ok) throw new Error("Could not load history");
   return res.json();
-}
-
-export async function clearSession(sessionId) {
-  await fetch(`${BASE_URL}/sessions/${sessionId}`, { method: "DELETE" });
 }
 
 /**

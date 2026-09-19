@@ -24,13 +24,15 @@ class _Query:
         self._payload = payload
         self._filters = []
         self._order_by = None
+        self._order_desc = False
 
     def eq(self, column, value):
         self._filters.append((column, value))
         return self
 
-    def order(self, column):
+    def order(self, column, desc=False):
         self._order_by = column
+        self._order_desc = desc
         return self
 
     def _matching(self):
@@ -50,19 +52,37 @@ class _Query:
         if self._op == "select":
             rows = self._matching()
             if self._order_by:
-                rows = sorted(rows, key=lambda r: r[self._order_by])
+                rows = sorted(
+                    rows, key=lambda r: r[self._order_by], reverse=self._order_desc
+                )
             return _Result([dict(r) for r in rows])
+
+        if self._op == "update":
+            matched = self._matching()
+            for row in matched:
+                row.update(self._payload)
+            return _Result([dict(r) for r in matched])
 
         if self._op == "delete":
             doomed = self._matching()
             self._table.rows = [r for r in self._table.rows if r not in doomed]
+            if self._table.name == "sessions":
+                # Mimic messages.session_id's ON DELETE CASCADE.
+                doomed_ids = {r["id"] for r in doomed}
+                self._table.db.table("messages").rows = [
+                    m
+                    for m in self._table.db.table("messages").rows
+                    if m["session_id"] not in doomed_ids
+                ]
             return _Result(doomed)
 
         raise NotImplementedError(self._op)
 
 
 class _Table:
-    def __init__(self):
+    def __init__(self, db, name):
+        self.db = db
+        self.name = name
         self.rows = []
         self._clock = datetime(2026, 1, 1, tzinfo=timezone.utc)
 
@@ -78,6 +98,9 @@ class _Table:
     def insert(self, payload):
         return _Query(self, "insert", payload)
 
+    def update(self, payload):
+        return _Query(self, "update", payload)
+
     def delete(self):
         return _Query(self, "delete")
 
@@ -87,10 +110,10 @@ class FakeSupabase:
         self._tables = {}
 
     def table(self, name):
-        return self._tables.setdefault(name, _Table())
+        return self._tables.setdefault(name, _Table(self, name))
 
     def rows(self, name):
-        return self._tables.setdefault(name, _Table()).rows
+        return self.table(name).rows
 
 
 class FakeGroq:

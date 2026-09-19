@@ -1,10 +1,11 @@
 """Test cases for the chat API.
 
-The suite is organised around the four things that can independently break:
-  1. session lifecycle      - can a conversation be started and reset?
-  2. streaming contract     - does the wire format match what the client parses?
-  3. persistence            - do both sides of the turn reach the database?
-  4. conversational memory  - is prior history actually replayed to the model?
+The suite is organised around the things that can independently break:
+  1. session lifecycle      - can a conversation be started, listed, and deleted?
+  2. session titles         - are titles auto-set from the first message, and renameable?
+  3. streaming contract     - does the wire format match what the client parses?
+  4. persistence            - do both sides of the turn reach the database?
+  5. conversational memory  - is prior history actually replayed to the model?
 """
 
 import json
@@ -51,17 +52,17 @@ def test_history_starts_empty(client):
     assert client.get(f"/messages/{session_id}").json() == []
 
 
-def test_clear_session_removes_messages_but_keeps_session(client, db):
+def test_deleting_a_session_removes_it_and_its_messages(client, db):
     session_id = start_session(client)
     client.post("/chat/stream", json={"session_id": session_id, "message": "hi"})
 
     client.delete(f"/sessions/{session_id}")
 
-    assert client.get(f"/messages/{session_id}").json() == []
-    assert [r["id"] for r in db.rows("sessions")] == [session_id]
+    assert db.rows("sessions") == []
+    assert db.rows("messages") == []
 
 
-def test_clearing_one_session_leaves_the_other_intact(client):
+def test_deleting_one_session_leaves_the_other_intact(client):
     kept = start_session(client)
     dropped = start_session(client)
     for sid in (kept, dropped):
@@ -70,7 +71,92 @@ def test_clearing_one_session_leaves_the_other_intact(client):
     client.delete(f"/sessions/{dropped}")
 
     assert len(client.get(f"/messages/{kept}").json()) == 2
-    assert client.get(f"/messages/{dropped}").json() == []
+    assert [s["id"] for s in client.get("/sessions").json()] == [kept]
+
+
+def test_deleted_session_cannot_be_chatted_with_again(client):
+    session_id = start_session(client)
+    client.delete(f"/sessions/{session_id}")
+
+    response = client.post(
+        "/chat/stream", json={"session_id": session_id, "message": "hi"}
+    )
+
+    assert response.status_code == 404
+
+
+# --- session listing & renaming -----------------------------------------------
+
+
+def test_new_session_has_no_title(client):
+    session_id = start_session(client)
+
+    sessions = client.get("/sessions").json()
+    assert sessions == [{"id": session_id, "title": None, "created_at": sessions[0]["created_at"]}]
+
+
+def test_first_message_sets_the_title(client):
+    session_id = start_session(client)
+
+    client.post(
+        "/chat/stream", json={"session_id": session_id, "message": "tell me about maistorage"}
+    )
+
+    sessions = client.get("/sessions").json()
+    assert sessions[0]["title"] == "tell me about maistorage"
+
+
+def test_long_first_message_is_truncated_into_a_title(client):
+    session_id = start_session(client)
+    long_message = "x" * 80
+
+    client.post("/chat/stream", json={"session_id": session_id, "message": long_message})
+
+    title = client.get("/sessions").json()[0]["title"]
+    assert len(title) == 50
+    assert title.endswith("…")
+
+
+def test_second_message_does_not_overwrite_the_title(client):
+    session_id = start_session(client)
+    client.post("/chat/stream", json={"session_id": session_id, "message": "first"})
+
+    client.post("/chat/stream", json={"session_id": session_id, "message": "second"})
+
+    assert client.get("/sessions").json()[0]["title"] == "first"
+
+
+def test_sessions_are_listed_newest_first(client):
+    older = start_session(client)
+    newer = start_session(client)
+
+    ids = [s["id"] for s in client.get("/sessions").json()]
+    assert ids == [newer, older]
+
+
+def test_rename_session(client):
+    session_id = start_session(client)
+
+    response = client.patch(f"/sessions/{session_id}", json={"title": "My renamed chat"})
+
+    assert response.status_code == 200
+    assert client.get("/sessions").json()[0]["title"] == "My renamed chat"
+
+
+def test_renaming_unknown_session_is_rejected(client):
+    response = client.patch(
+        "/sessions/11111111-1111-1111-1111-111111111111", json={"title": "x"}
+    )
+
+    assert response.status_code == 404
+
+
+def test_renaming_with_an_empty_title_is_rejected(client):
+    session_id = start_session(client)
+
+    response = client.patch(f"/sessions/{session_id}", json={"title": ""})
+
+    assert response.status_code == 422
 
 
 def test_unknown_session_is_rejected(client):
@@ -225,11 +311,12 @@ def test_each_session_has_its_own_memory(client, llm):
     assert llm.last_messages == [{"role": "user", "content": "fresh start"}]
 
 
-def test_cleared_session_forgets_prior_turns(client, llm):
-    session_id = start_session(client)
-    client.post("/chat/stream", json={"session_id": session_id, "message": "old"})
+def test_new_session_after_a_delete_starts_with_no_memory(client, llm):
+    old_session = start_session(client)
+    client.post("/chat/stream", json={"session_id": old_session, "message": "old"})
+    client.delete(f"/sessions/{old_session}")
 
-    client.delete(f"/sessions/{session_id}")
-    client.post("/chat/stream", json={"session_id": session_id, "message": "new"})
+    new_session = start_session(client)
+    client.post("/chat/stream", json={"session_id": new_session, "message": "new"})
 
     assert llm.last_messages == [{"role": "user", "content": "new"}]
