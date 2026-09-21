@@ -19,6 +19,7 @@ export default function App() {
   const [streaming, setStreaming] = useState(false);
   const [streamingContent, setStreamingContent] = useState("");
   const bottomRef = useRef(null);
+  const inputRef = useRef(null);
 
   useEffect(() => {
     listSessions().then((existing) => {
@@ -30,6 +31,13 @@ export default function App() {
   useEffect(() => {
     bottomRef.current?.scrollIntoView({ behavior: "smooth" });
   }, [messages, streamingContent]);
+
+  // The textarea is disabled while a reply streams, which drops focus. Take it
+  // back when the reply finishes or the conversation changes, so the user can
+  // keep typing without reaching for the mouse.
+  useEffect(() => {
+    if (!streaming) inputRef.current?.focus();
+  }, [streaming, activeId]);
 
   async function selectSession(id) {
     setActiveId(id);
@@ -181,6 +189,7 @@ export default function App() {
 
         <footer className="input-area">
           <textarea
+            ref={inputRef}
             className="input-box"
             placeholder="Type a message… (Enter to send, Shift+Enter for newline)"
             value={input}
