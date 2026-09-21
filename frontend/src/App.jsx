@@ -36,8 +36,12 @@ export default function App() {
     setInput("");
     setStreamingContent("");
     setStreaming(false);
-    const msgs = await getMessages(id);
-    if (Array.isArray(msgs)) setMessages(msgs);
+    try {
+      setMessages(await getMessages(id));
+    } catch (err) {
+      // Otherwise a failed load is indistinguishable from an empty chat.
+      setMessages([{ role: "assistant", content: `⚠️ ${err.message}`, failed: true }]);
+    }
   }
 
   // No database row is created here: an unused "New chat" that never receives a

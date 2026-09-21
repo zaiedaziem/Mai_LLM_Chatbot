@@ -1,13 +1,15 @@
-"""In-memory stand-ins for Supabase and Groq.
+"""In-memory stand-ins for Supabase and the LLM.
 
 The real clients are network-bound, which makes tests slow, flaky and dependent
-on a live API key. These fakes mimic just enough of each client's surface for
-the endpoints to run unchanged.
+on a live API key. FakeSupabase mimics just enough of the query builder for the
+endpoints to run unchanged; FakeLLM implements our own LLMProvider interface,
+so it never has to imitate a vendor SDK.
 """
 
 import uuid
 from datetime import datetime, timedelta, timezone
-from types import SimpleNamespace
+
+from src.llm import LLMProvider
 
 
 class _Result:
@@ -116,25 +118,20 @@ class FakeSupabase:
         return self.table(name).rows
 
 
-class FakeGroq:
-    """Records the messages it was called with and replays a scripted response."""
+class FakeLLM(LLMProvider):
+    """Replays a scripted token list and records what it was asked."""
 
     def __init__(self, tokens=("Hello", " there", "!"), error=None):
         self._tokens = tokens
         self._error = error
         self.last_messages = None
+        self.last_system_prompt = None
         self.call_count = 0
 
-        self.chat = SimpleNamespace(completions=SimpleNamespace(create=self._create))
-
-    def _create(self, *, model, messages, stream, max_tokens=None):
+    def stream(self, messages, system_prompt=None):
         self.call_count += 1
         self.last_messages = messages
+        self.last_system_prompt = system_prompt
         if self._error:
             raise self._error
-        return iter(
-            SimpleNamespace(
-                choices=[SimpleNamespace(delta=SimpleNamespace(content=token))]
-            )
-            for token in self._tokens
-        )
+        yield from self._tokens

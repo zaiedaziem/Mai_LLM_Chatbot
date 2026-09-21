@@ -33,9 +33,9 @@ venv/Scripts/activate                    # macOS/Linux: source venv/bin/activate
                                           #   below land here instead of your system Python
 pip install -r requirements-dev.txt      # install FastAPI, Supabase, Groq, pytest, etc. into venv
 cp .env.example .env                     # then fill in the three keys (Supabase URL/key, Groq key)
-uvicorn main:app --reload                # start the API server
-                                          # ^ main:app = "the `app` object in main.py"
-                                          #   --reload  = restart automatically on file changes
+uvicorn src.main:app --reload            # start the API server
+                                          # ^ src.main:app = "the `app` object in src/main.py"
+                                          #   --reload     = restart automatically on file changes
 ```
 
 Runs on http://localhost:8000. Every command after `activate` must be run
@@ -62,6 +62,41 @@ docker compose up --build
 ```
 
 Frontend on http://localhost:3000, API on http://localhost:8000.
+
+---
+
+## Project structure
+
+```
+backend/
+├── src/
+│   ├── main.py            wiring only: CORS + routers
+│   ├── config.py          every env var, read in one place
+│   ├── dependencies.py    get_db / get_llm / get_system_prompt (swapped out in tests)
+│   ├── api/
+│   │   ├── sessions.py    /sessions CRUD + /sessions/{id}/messages
+│   │   └── chat.py        /chat/stream
+│   ├── llm/
+│   │   ├── base.py        LLMProvider interface
+│   │   └── groq.py        GroqProvider — the only file that imports the Groq SDK
+│   ├── middleware/
+│   │   └── rate_limit.py  sliding-window limiter, per client IP
+│   └── prompts/
+│       └── system_prompt.md
+├── tests/
+├── migrations/            one-off SQL for databases created before a schema change
+└── schema.sql             full schema for a fresh project
+frontend/
+└── src/
+    ├── App.jsx            state + chat window
+    ├── Sidebar.jsx        session list, rename, delete
+    └── api.js             fetch wrappers + the SSE parser
+```
+
+The split follows *reasons to change*: the LLM vendor, the rate-limit policy
+and the HTTP routes each vary independently, so each has its own module. Before
+those concerns existed the backend was a single `main.py`, which was the right
+size for it at the time.
 
 ---
 
@@ -117,6 +152,44 @@ missing key raises a clear error at request time instead of a cryptic one at
 startup) and lets the tests substitute in-memory fakes through
 `app.dependency_overrides` — no network, no monkeypatching of globals.
 
+### The provider abstraction
+
+The streaming endpoint talks to an `LLMProvider` interface with one method,
+`stream(messages, system_prompt)`. `GroqProvider` is the only implementation,
+and the only file that imports the Groq SDK. Swapping vendors is a new subclass
+and one line in `dependencies.py`; the endpoint does not change.
+
+The system prompt is passed *separately* from the conversation on purpose.
+Providers attach it differently — a `"system"` role message for OpenAI-style
+APIs, a `system_instruction` argument for Gemini — and the endpoint should not
+have to know which. It also keeps the stored history clean: the database holds
+only real turns, so a reload replays exactly what the user saw.
+
+A side effect worth naming: the test double implements our four-line interface
+instead of imitating a vendor SDK, which made it roughly half the size.
+
+### Rate limiting
+
+A sliding window per client IP, applied to `/chat/stream` only — the endpoint
+that costs money. It is a FastAPI dependency rather than ASGI middleware
+precisely so that cheap endpoints (listing sessions, loading history) are never
+throttled. Rejected requests get a `429` with a `Retry-After` header, which the
+frontend reads to show a countdown; `expose_headers` in the CORS config is what
+lets the browser see that header cross-origin.
+
+State is in-process memory: it resets on restart and is not shared between
+workers. That is the right trade for a single-instance demo. The production
+version is the same algorithm with the timestamps in Redis. Limits are
+configurable via `RATE_LIMIT_REQUESTS` and `RATE_LIMIT_WINDOW_SECONDS`.
+
+### The system prompt
+
+Loaded from `src/prompts/system_prompt.md`, resolved relative to the file
+rather than the working directory so it is found no matter where uvicorn is
+launched from. It is injected as a proper system message, never concatenated
+onto the user's text — the latter weakens the instruction and lets a user
+override it.
+
 ### The SSE parser's buffer
 
 `reader.read()` yields network chunks, not lines; a chunk can end halfway
@@ -133,10 +206,11 @@ local testing and corrupts tokens under real network conditions.
 cd backend && python -m pytest tests/ -q
 ```
 
-26 tests, <0.5s, no network. `tests/fakes.py` provides an in-memory Supabase
+34 tests, <1s, no network. `tests/fakes.py` provides an in-memory Supabase
 (mimicking the chained `.select().eq().order().execute()` builder, including
-`ON DELETE CASCADE`) and a Groq double that replays a scripted token list and
-records the messages it received.
+`ON DELETE CASCADE`) and a `FakeLLM` that implements the `LLMProvider`
+interface, replays a scripted token list, and records what it was asked. Both
+are wired in through `app.dependency_overrides` in `conftest.py`.
 
 The suite is organised around the things that can independently break.
 
@@ -157,9 +231,8 @@ tokens arrive as *separate* frames ending in `{"done": true}`. That per-frame
 assertion is the one that would catch the most likely regression: buffering the
 whole reply and flushing it once still produces correct text, still passes a
 naive "did I get the right answer" test, and completely defeats the purpose of
-the feature. Empty deltas (which Groq emits at stream edges) are asserted to be
-filtered out, and a provider failure is asserted to arrive as an in-band error
-frame on a 200 response.
+the feature. A provider failure is asserted to arrive as an in-band error frame
+on a 200 response.
 
 **4. Persistence** — both sides of a turn are stored in the right order, and the
 stored assistant message is asserted to equal the concatenation of the streamed
@@ -169,10 +242,22 @@ message behind.
 
 **5. Conversational memory** — the requirement "the LLM should know what the
 user asked previously" is only really pinned down by inspecting what was sent to
-the model, so the Groq fake records it. The first turn must send just the new
+the model, so `FakeLLM` records it. The first turn must send just the new
 message; the second must replay turn one's question *and* answer alongside it.
-Sessions are asserted not to leak history into each other, and a cleared session
-is asserted to genuinely forget.
+Sessions are asserted not to leak history into each other, and a new session
+after a delete is asserted to start empty. The system prompt is asserted to
+reach the provider *without* appearing in the stored conversation.
+
+**6. Provider** (`test_groq_provider.py`) — `GroqProvider` is unit-tested with a
+stub SDK client: empty deltas are dropped, the system prompt becomes the first
+`"system"` message, and no prompt means no system message. These are Groq's
+quirks, so they are tested where the Groq code lives, not in the endpoint.
+
+**7. Rate limiting** (`test_rate_limit.py`) — requests under the limit succeed;
+the one over it gets `429` with `Retry-After`; a rejected message is asserted
+*not* to reach the database (otherwise a reload would show a turn with no reply);
+and cheap endpoints are asserted to be unaffected. The limit is patched low via
+`monkeypatch` so the tests run in milliseconds.
 
 ### What is deliberately not covered
 
@@ -191,8 +276,8 @@ looking at it.
 | `GET` | `/sessions` | List all sessions, newest first |
 | `PATCH` | `/sessions/{session_id}` | Rename a session |
 | `DELETE` | `/sessions/{session_id}` | Delete a session and its messages |
-| `GET` | `/messages/{session_id}` | Replay stored history |
-| `POST` | `/chat/stream` | Stream a reply as SSE |
+| `GET` | `/sessions/{session_id}/messages` | Replay stored history |
+| `POST` | `/chat/stream` | Stream a reply as SSE — rate limited |
 
 Interactive docs at http://localhost:8000/docs.
 

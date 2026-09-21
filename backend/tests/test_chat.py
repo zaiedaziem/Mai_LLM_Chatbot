@@ -6,12 +6,16 @@ The suite is organised around the things that can independently break:
   3. streaming contract     - does the wire format match what the client parses?
   4. persistence            - do both sides of the turn reach the database?
   5. conversational memory  - is prior history actually replayed to the model?
+
+Provider-specific behaviour lives in test_groq_provider.py; the rate limiter
+in test_rate_limit.py.
 """
 
 import json
 
-import main
-from fakes import FakeGroq
+from fakes import FakeLLM
+from src.dependencies import get_llm
+from src.main import app
 
 
 def use_llm(fake):
@@ -19,7 +23,7 @@ def use_llm(fake):
 
     The `client` fixture clears overrides on teardown, so this is contained.
     """
-    main.app.dependency_overrides[main.get_llm] = lambda: fake
+    app.dependency_overrides[get_llm] = lambda: fake
     return fake
 
 
@@ -49,7 +53,7 @@ def test_create_session_returns_id_and_persists_it(client, db):
 def test_history_starts_empty(client):
     session_id = start_session(client)
 
-    assert client.get(f"/messages/{session_id}").json() == []
+    assert client.get(f"/sessions/{session_id}/messages").json() == []
 
 
 def test_deleting_a_session_removes_it_and_its_messages(client, db):
@@ -70,7 +74,7 @@ def test_deleting_one_session_leaves_the_other_intact(client):
 
     client.delete(f"/sessions/{dropped}")
 
-    assert len(client.get(f"/messages/{kept}").json()) == 2
+    assert len(client.get(f"/sessions/{kept}/messages").json()) == 2
     assert [s["id"] for s in client.get("/sessions").json()] == [kept]
 
 
@@ -196,22 +200,8 @@ def test_tokens_arrive_individually_and_end_with_done(client):
     assert events[-1] == {"done": True}
 
 
-def test_empty_deltas_are_not_forwarded(client):
-    # Groq emits empty deltas around the edges of a stream; forwarding them
-    # would render as stray blank frames on the client.
-    use_llm(FakeGroq(tokens=("", "Hi", "")))
-    session_id = start_session(client)
-
-    response = client.post(
-        "/chat/stream", json={"session_id": session_id, "message": "hi"}
-    )
-
-    events = sse_events(response)
-    assert [e["content"] for e in events[:-1]] == ["Hi"]
-
-
 def test_provider_failure_is_reported_as_an_error_frame(client):
-    use_llm(FakeGroq(error=RuntimeError("rate limited")))
+    use_llm(FakeLLM(error=RuntimeError("rate limited")))
     session_id = start_session(client)
 
     response = client.post(
@@ -226,12 +216,12 @@ def test_provider_failure_is_reported_as_an_error_frame(client):
 
 
 def test_failed_turn_does_not_persist_a_partial_reply(client):
-    use_llm(FakeGroq(error=RuntimeError("boom")))
+    use_llm(FakeLLM(error=RuntimeError("boom")))
     session_id = start_session(client)
 
     client.post("/chat/stream", json={"session_id": session_id, "message": "hi"})
 
-    roles = [m["role"] for m in client.get(f"/messages/{session_id}").json()]
+    roles = [m["role"] for m in client.get(f"/sessions/{session_id}/messages").json()]
     assert roles == ["user"]
 
 
@@ -243,7 +233,7 @@ def test_both_sides_of_a_turn_are_stored_in_order(client):
 
     client.post("/chat/stream", json={"session_id": session_id, "message": "hi"})
 
-    stored = client.get(f"/messages/{session_id}").json()
+    stored = client.get(f"/sessions/{session_id}/messages").json()
     assert [(m["role"], m["content"]) for m in stored] == [
         ("user", "hi"),
         ("assistant", "Hello there!"),
@@ -258,7 +248,7 @@ def test_assistant_message_is_the_full_concatenated_stream(client):
     )
 
     streamed = "".join(e["content"] for e in sse_events(response)[:-1])
-    stored = client.get(f"/messages/{session_id}").json()[-1]["content"]
+    stored = client.get(f"/sessions/{session_id}/messages").json()[-1]["content"]
     # What the user watched appear must equal what a page reload replays.
     assert stored == streamed
 
@@ -268,7 +258,7 @@ def test_messages_from_other_sessions_are_not_returned(client):
     second = start_session(client)
     client.post("/chat/stream", json={"session_id": first, "message": "first"})
 
-    assert client.get(f"/messages/{second}").json() == []
+    assert client.get(f"/sessions/{second}/messages").json() == []
 
 
 # --- 4. conversational memory ------------------------------------------------
@@ -320,3 +310,14 @@ def test_new_session_after_a_delete_starts_with_no_memory(client, llm):
     client.post("/chat/stream", json={"session_id": new_session, "message": "new"})
 
     assert llm.last_messages == [{"role": "user", "content": "new"}]
+
+
+def test_system_prompt_goes_to_the_provider_not_into_the_history(client, llm):
+    session_id = start_session(client)
+
+    client.post("/chat/stream", json={"session_id": session_id, "message": "hi"})
+
+    # The provider decides how to attach the system prompt; the stored
+    # conversation must stay clean so a reload shows only real turns.
+    assert llm.last_system_prompt == "You are a test assistant."
+    assert llm.last_messages == [{"role": "user", "content": "hi"}]
