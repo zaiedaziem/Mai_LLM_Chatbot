@@ -17,4 +17,6 @@ class LLMProvider(ABC):
         system_prompt is separate from messages because providers attach it
         differently (a "system" role message for OpenAI-style APIs, a
         system_instruction argument for Gemini). The caller shouldn't care.
+        
+        takes a string as prompt and returns a string as response, streaming one token at a time. The caller shouldn't care about the underlying provider.
         """

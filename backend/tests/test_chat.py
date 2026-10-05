@@ -91,7 +91,7 @@ def test_deleted_session_cannot_be_chatted_with_again(client):
 
 # --- session listing & renaming -----------------------------------------------
 
-
+# 
 def test_new_session_has_no_title(client):
     session_id = start_session(client)
 

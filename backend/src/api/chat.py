@@ -36,7 +36,7 @@ def chat_stream(
     request: ChatRequest,
     db: Client = Depends(get_db),
     llm: LLMProvider = Depends(get_llm),
-    system_prompt: str | None = Depends(get_system_prompt),
+    system_prompt: str | None = Depends(get_system_prompt),  # instruction
 ):
     session = db.table("sessions").select("id, title").eq("id", request.session_id).execute()
     if not session.data:

@@ -19,3 +19,8 @@ app.add_middleware(
 
 app.include_router(sessions.router)
 app.include_router(chat.router)
+
+# default endpoint
+@app.get("/")
+def root():
+    return {"message": "API is running", "docs": "/docs"}
